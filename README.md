@@ -75,7 +75,7 @@ Run with no prompt (or with `--chat`) on a terminal for an interactive REPL:
 $ ./target/release/gpt2
 
 gpt2 chat: 12 layers, 12 heads, d_model 768 (context 1024 tokens)
-commands: /help, /reset, /save, /load, /quit   (Ctrl-D to exit)
+commands: /help, /reset, /save, /load, /list, /quit   (Ctrl-D to exit)
 
 you> What is the capital of France?
 gpt2> The capital of France is Paris.
@@ -116,7 +116,15 @@ How the session works:
   long session is. Bare `/load` resumes the newest transcript in the current
   directory: the most recently modified `*.txt` file that opens with a `User: `
   line, which is what `/save` produces, so unrelated text files are skipped. It
-  reports the file it picked, so a resume is never a guess.
+  reports the file it picked, so a resume is never a guess. `/list` shows those
+  same transcripts newest first, with size and modification time (UTC), and
+  stars the one a bare `/load` would resume:
+
+  ```
+  saved transcripts in . (* = what a bare /load picks)
+    * chat.txt         118 B  2026-11-08 21:34 UTC
+      notes-2.txt       52 B  2026-11-07 09:02 UTC
+  ```
 
 ### Measuring what the cache saves
 

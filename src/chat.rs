@@ -11,7 +11,7 @@
 //! re-prefill of the whole transcript, which is what the cache saves.
 
 use std::io::{BufRead, Write};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bpe::{StreamDecoder, Tokenizer};
 use crate::model::{Config, Gpt2, KvCache};
@@ -342,7 +342,7 @@ pub fn run(
     );
     let _ = writeln!(
         out,
-        "commands: /help, /reset, /quit   (Ctrl-D to exit)\n"
+        "commands: /help, /reset, /save, /load, /list, /quit   (Ctrl-D to exit)\n"
     );
 
     loop {
@@ -365,7 +365,7 @@ pub fn run(
                 "help" => {
                     let _ = writeln!(
                         out,
-                        "  /help        this text\n  /reset       forget the conversation (clears the KV cache)\n  /save <file> write the transcript to <file>\n  /load [file] replace the conversation with <file>, default: newest *.txt here\n  /quit        exit"
+                        "  /help        this text\n  /reset       forget the conversation (clears the KV cache)\n  /save <file> write the transcript to <file>\n  /load [file] replace the conversation with <file>, default: newest *.txt here\n  /list        saved transcripts here, newest first, with times and sizes\n  /quit        exit"
                     );
                 }
                 "reset" => {
@@ -422,6 +422,32 @@ pub fn run(
                         }
                     }
                 }
+                "list" | "ls" => match saved_transcripts() {
+                    Ok(files) if files.is_empty() => {
+                        let _ = writeln!(
+                            out,
+                            "(no saved transcripts here; /save <file> writes one)"
+                        );
+                    }
+                    Ok(files) => {
+                        let width = files.iter().map(|f| f.name.len()).max().unwrap_or(0).max(8);
+                        let _ = writeln!(out, "saved transcripts in . (* = what a bare /load picks)");
+                        for (i, f) in files.iter().enumerate() {
+                            let mark = if i == 0 { '*' } else { ' ' };
+                            let _ = writeln!(
+                                out,
+                                "  {mark} {:<width$}  {:>9}  {} UTC",
+                                f.name,
+                                format_size(f.size),
+                                format_utc(f.modified),
+                                width = width
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        let _ = writeln!(out, "(cannot list: {e})");
+                    }
+                },
                 other => {
                     let _ = writeln!(out, "(unknown command /{other}, try /help)");
                 }
@@ -541,12 +567,20 @@ fn write_chunk(out: &mut impl Write, chunk: &str, first: &mut bool) {
     }
 }
 
-/// The most recently modified `*.txt` file in the working directory that looks
-/// like a transcript written by `/save`, for a bare `/load`.
-fn newest_transcript() -> Result<String, String> {
+/// A transcript written by `/save` and still sitting in the working directory.
+#[derive(Clone, Debug)]
+struct SavedTranscript {
+    name: String,
+    modified: SystemTime,
+    size: u64,
+}
+
+/// Every saved transcript in the working directory, newest first. Both `/list`
+/// and a bare `/load` use this, so they can never disagree about what is there.
+fn saved_transcripts() -> Result<Vec<SavedTranscript>, String> {
     let entries =
         std::fs::read_dir(".").map_err(|e| format!("cannot list current directory: {e}"))?;
-    let mut best: Option<(std::time::SystemTime, String)> = None;
+    let mut files = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if !is_txt(&path) {
@@ -560,15 +594,72 @@ fn newest_transcript() -> Result<String, String> {
         if !looks_like_transcript(&head) {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-        if best.as_ref().map_or(true, |(t, _)| modified > *t) {
-            best = Some((modified, name));
-        }
+        files.push(SavedTranscript {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            modified: meta.modified().unwrap_or(UNIX_EPOCH),
+            size: meta.len(),
+        });
     }
-    best.map(|(_, name)| name).ok_or_else(|| {
-        "no saved transcript here (expected a *.txt file starting with 'User: ')".to_string()
-    })
+    sort_transcripts(&mut files);
+    Ok(files)
+}
+
+fn sort_transcripts(files: &mut [SavedTranscript]) {
+    files.sort_by(|a, b| {
+        b.modified
+            .cmp(&a.modified)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+/// The most recently modified transcript, for a bare `/load`.
+fn newest_transcript() -> Result<String, String> {
+    saved_transcripts()?
+        .first()
+        .map(|f| f.name.clone())
+        .ok_or_else(|| {
+            "no saved transcript here (expected a *.txt file starting with 'User: ')".to_string()
+        })
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// Modification time as `YYYY-MM-DD HH:MM` in UTC: formats without a date crate
+/// and without guessing at the local offset.
+fn format_utc(t: SystemTime) -> String {
+    let secs = t
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    let rem = secs.rem_euclid(86_400);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
+        rem / 3600,
+        (rem % 3600) / 60
+    )
+}
+
+/// Howard Hinnant's days-to-civil algorithm (proleptic Gregorian).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 fn is_txt(path: &std::path::Path) -> bool {
@@ -702,6 +793,39 @@ mod tests {
         assert!(is_txt(std::path::Path::new("chat.txt")));
         assert!(is_txt(std::path::Path::new("chat.TXT")));
         assert!(!is_txt(std::path::Path::new("chat.md")));
+    }
+
+    #[test]
+    fn formats_sizes_readably() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(1023), "1023 B");
+        assert_eq!(format_size(1024), "1.0 KiB");
+        assert_eq!(format_size(1536), "1.5 KiB");
+        assert_eq!(format_size(2 * 1024 * 1024), "2.0 MiB");
+    }
+
+    #[test]
+    fn formats_utc_timestamps() {
+        let at = |secs: u64| UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        assert_eq!(format_utc(at(0)), "1970-01-01 00:00");
+        assert_eq!(format_utc(at(1_700_000_000)), "2023-11-14 22:13");
+        assert_eq!(format_utc(at(1_767_225_600)), "2026-01-01 00:00");
+    }
+
+    #[test]
+    fn sorts_transcripts_newest_first() {
+        let at = |secs: u64| UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let make = |name: &str, secs: u64| SavedTranscript {
+            name: name.to_string(),
+            modified: at(secs),
+            size: 1,
+        };
+        let mut files = vec![make("old.txt", 10), make("new.txt", 20), make("b.txt", 20)];
+        sort_transcripts(&mut files);
+        // Newest first, ties broken by name so the order is stable.
+        assert_eq!(files[0].name, "b.txt");
+        assert_eq!(files[1].name, "new.txt");
+        assert_eq!(files[2].name, "old.txt");
     }
 
     #[test]
