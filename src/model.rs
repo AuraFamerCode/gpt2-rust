@@ -3,7 +3,11 @@
 //! Weights come from the HuggingFace safetensors file. Conv1D weights in the
 //! original checkpoint are `[in, out]`; the safetensors conversion and some
 //! re-uploads differ, so `take_weight` normalises everything to `[out, in]`.
+//!
+//! Projections run either in fp32 or as int8 weights with integer dot products
+//! (`Precision`). All activations, LayerNorm and the KV cache stay fp32.
 
+use crate::quant::{matmul_i8, QTensor};
 use crate::tensor::{gelu, layernorm, matmul, softmax, Tensor};
 use std::collections::HashMap;
 
@@ -36,18 +40,106 @@ impl Config {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Precision {
+    /// Exact fp32 weights.
+    F32,
+    /// int8 weights, int8 activations, int32 accumulation.
+    I8,
+}
+
+impl Precision {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "f32" | "fp32" | "float32" => Ok(Precision::F32),
+            "int8" | "i8" | "q8" => Ok(Precision::I8),
+            other => Err(format!("unknown precision {other} (expected f32 or int8)")),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Precision::F32 => "f32",
+            Precision::I8 => "int8",
+        }
+    }
+}
+
+/// A projection matrix stored as `[rows, cols]` with `rows` = output features.
+pub struct Weight {
+    data: WeightData,
+    rows: usize,
+    cols: usize,
+}
+
+enum WeightData {
+    Dense(Vec<f32>),
+    Int8(QTensor),
+}
+
+impl Weight {
+    fn new(
+        data: Vec<f32>,
+        rows: usize,
+        cols: usize,
+        precision: Precision,
+    ) -> Result<Self, String> {
+        if data.len() != rows * cols {
+            return Err(format!(
+                "weight has {} values, expected {}",
+                data.len(),
+                rows * cols
+            ));
+        }
+        let data = match precision {
+            Precision::F32 => WeightData::Dense(data),
+            Precision::I8 => WeightData::Int8(QTensor::from_f32(&data, rows, cols)),
+        };
+        Ok(Weight { data, rows, cols })
+    }
+
+    /// `out[m, rows] = a[m, cols] @ self^T + bias`
+    fn linear(&self, a: &[f32], m: usize, k: usize, bias: Option<&[f32]>, out: &mut [f32]) {
+        debug_assert_eq!(k, self.cols);
+        debug_assert_eq!(out.len(), m * self.rows);
+        match &self.data {
+            WeightData::Dense(w) => matmul(a, m, k, w, self.rows, bias, out),
+            WeightData::Int8(q) => matmul_i8(a, m, k, q, bias, out),
+        }
+    }
+
+    /// Copy (or dequantize) one row, for embedding lookups.
+    fn gather(&self, idx: usize, out: &mut [f32]) {
+        match &self.data {
+            WeightData::Dense(w) => out.copy_from_slice(&w[idx * self.cols..(idx + 1) * self.cols]),
+            WeightData::Int8(q) => q.dequant_row(idx, out),
+        }
+    }
+
+    fn numel(&self) -> usize {
+        self.rows * self.cols
+    }
+
+    fn nbytes(&self) -> usize {
+        match &self.data {
+            WeightData::Dense(w) => w.len() * std::mem::size_of::<f32>(),
+            WeightData::Int8(q) => q.nbytes(),
+        }
+    }
+}
+
 struct Layer {
     ln1_w: Vec<f32>,
     ln1_b: Vec<f32>,
-    attn_w: Vec<f32>, // [3 * n_embd, n_embd]
+    attn_w: Weight, // [3 * n_embd, n_embd]
     attn_b: Vec<f32>,
-    attn_proj_w: Vec<f32>, // [n_embd, n_embd]
+    attn_proj_w: Weight, // [n_embd, n_embd]
     attn_proj_b: Vec<f32>,
     ln2_w: Vec<f32>,
     ln2_b: Vec<f32>,
-    fc_w: Vec<f32>, // [n_inner, n_embd]
+    fc_w: Weight, // [n_inner, n_embd]
     fc_b: Vec<f32>,
-    fc_proj_w: Vec<f32>, // [n_embd, n_inner]
+    fc_proj_w: Weight, // [n_embd, n_inner]
     fc_proj_b: Vec<f32>,
 }
 
@@ -67,12 +159,11 @@ impl KvCache {
             len: 0,
         }
     }
-
 }
 
 pub struct Gpt2 {
     pub cfg: Config,
-    wte: Vec<f32>, // [n_vocab, n_embd] (also the LM head: weights are tied)
+    wte: Weight, // [n_vocab, n_embd], also the LM head (weights are tied)
     wpe: Vec<f32>, // [n_ctx, n_embd]
     ln_f_w: Vec<f32>,
     ln_f_b: Vec<f32>,
@@ -80,14 +171,16 @@ pub struct Gpt2 {
 }
 
 impl Gpt2 {
-    pub fn load(mut tensors: HashMap<String, Tensor>, mut cfg: Config) -> Result<Self, String> {
+    pub fn load(
+        mut tensors: HashMap<String, Tensor>,
+        mut cfg: Config,
+        precision: Precision,
+    ) -> Result<Self, String> {
         let d = cfg.n_embd;
 
-        let wte = tensors
-            .remove("wte.weight")
-            .ok_or("missing wte.weight")?;
-        cfg.n_vocab = wte.shape[0];
-        cfg.n_embd = wte.shape[1];
+        let wte_t = tensors.remove("wte.weight").ok_or("missing wte.weight")?;
+        cfg.n_vocab = wte_t.shape[0];
+        cfg.n_embd = wte_t.shape[1];
         cfg.n_ctx = tensors
             .get("wpe.weight")
             .map(|t| t.shape[0])
@@ -98,6 +191,7 @@ impl Gpt2 {
                 cfg.n_embd
             ));
         }
+        let wte = Weight::new(wte_t.data, cfg.n_vocab, cfg.n_embd, precision)?;
 
         // Infer the feed-forward width from the checkpoint rather than trusting
         // the config, so other GPT-2 sizes load without edits.
@@ -147,22 +241,22 @@ impl Gpt2 {
             layers.push(Layer {
                 ln1_w: take_bias(&mut tensors, &p("ln_1.weight"), d)?,
                 ln1_b: take_bias(&mut tensors, &p("ln_1.bias"), d)?,
-                attn_w: take_weight(&mut tensors, &p("attn.c_attn.weight"), 3 * d, d, conv1d)?,
+                attn_w: take_weight_proj(&mut tensors, &p("attn.c_attn.weight"), 3 * d, d, conv1d, precision)?,
                 attn_b: take_bias(&mut tensors, &p("attn.c_attn.bias"), 3 * d)?,
-                attn_proj_w: take_weight(&mut tensors, &p("attn.c_proj.weight"), d, d, conv1d)?,
+                attn_proj_w: take_weight_proj(&mut tensors, &p("attn.c_proj.weight"), d, d, conv1d, precision)?,
                 attn_proj_b: take_bias(&mut tensors, &p("attn.c_proj.bias"), d)?,
                 ln2_w: take_bias(&mut tensors, &p("ln_2.weight"), d)?,
                 ln2_b: take_bias(&mut tensors, &p("ln_2.bias"), d)?,
-                fc_w: take_weight(&mut tensors, &p("mlp.c_fc.weight"), inner, d, conv1d)?,
+                fc_w: take_weight_proj(&mut tensors, &p("mlp.c_fc.weight"), inner, d, conv1d, precision)?,
                 fc_b: take_bias(&mut tensors, &p("mlp.c_fc.bias"), inner)?,
-                fc_proj_w: take_weight(&mut tensors, &p("mlp.c_proj.weight"), d, inner, conv1d)?,
+                fc_proj_w: take_weight_proj(&mut tensors, &p("mlp.c_proj.weight"), d, inner, conv1d, precision)?,
                 fc_proj_b: take_bias(&mut tensors, &p("mlp.c_proj.bias"), d)?,
             });
         }
 
         let model = Gpt2 {
             cfg,
-            wte: wte.data,
+            wte,
             wpe: wpe.data,
             ln_f_w,
             ln_f_b,
@@ -174,7 +268,7 @@ impl Gpt2 {
 
     fn check_sizes(&self) -> Result<(), String> {
         let cfg = &self.cfg;
-        if self.wte.len() != cfg.n_vocab * cfg.n_embd {
+        if self.wte.numel() != cfg.n_vocab * cfg.n_embd {
             return Err("wte size mismatch".into());
         }
         if self.wpe.len() < cfg.n_ctx * cfg.n_embd {
@@ -184,20 +278,40 @@ impl Gpt2 {
     }
 
     pub fn n_params(&self) -> usize {
-        let mut n = self.wte.len() + self.wpe.len() + self.ln_f_w.len() + self.ln_f_b.len();
+        let mut n = self.wte.numel() + self.wpe.len() + self.ln_f_w.len() + self.ln_f_b.len();
         for l in &self.layers {
-            n += l.ln1_w.len()
+            n += l.attn_w.numel()
+                + l.attn_proj_w.numel()
+                + l.fc_w.numel()
+                + l.fc_proj_w.numel()
+                + l.ln1_w.len()
                 + l.ln1_b.len()
-                + l.attn_w.len()
                 + l.attn_b.len()
-                + l.attn_proj_w.len()
                 + l.attn_proj_b.len()
                 + l.ln2_w.len()
                 + l.ln2_b.len()
-                + l.fc_w.len()
                 + l.fc_b.len()
-                + l.fc_proj_w.len()
                 + l.fc_proj_b.len();
+        }
+        n
+    }
+
+    /// Bytes actually held for the weights (fp32 vs int8 + scales).
+    pub fn weight_bytes(&self) -> usize {
+        let mut n = self.wte.nbytes()
+            + self.wpe.len() * std::mem::size_of::<f32>()
+            + (self.ln_f_w.len() + self.ln_f_b.len()) * std::mem::size_of::<f32>();
+        for l in &self.layers {
+            n += l.attn_w.nbytes() + l.attn_proj_w.nbytes() + l.fc_w.nbytes() + l.fc_proj_w.nbytes();
+            n += (l.ln1_w.len()
+                + l.ln1_b.len()
+                + l.attn_b.len()
+                + l.attn_proj_b.len()
+                + l.ln2_w.len()
+                + l.ln2_b.len()
+                + l.fc_b.len()
+                + l.fc_proj_b.len())
+                * std::mem::size_of::<f32>();
         }
         n
     }
@@ -218,11 +332,11 @@ impl Gpt2 {
         for (i, &tok) in tokens.iter().enumerate() {
             let pos = start_pos + i;
             let (tok, pos) = (tok as usize, pos as usize);
-            let e = &self.wte[tok * d..(tok + 1) * d];
-            let p = &self.wpe[pos * d..(pos + 1) * d];
             let row = &mut x[i * d..(i + 1) * d];
+            self.wte.gather(tok, row);
+            let p = &self.wpe[pos * d..(pos + 1) * d];
             for j in 0..d {
-                row[j] = e[j] + p[j];
+                row[j] += p[j];
             }
         }
 
@@ -242,7 +356,7 @@ impl Gpt2 {
             for i in 0..t {
                 layernorm(&x[i * d..(i + 1) * d], &layer.ln1_w, &layer.ln1_b, cfg.eps, &mut xa[i * d..(i + 1) * d]);
             }
-            matmul(&xa, t, d, &layer.attn_w, 3 * d, Some(&layer.attn_b), &mut qkv);
+            layer.attn_w.linear(&xa, t, d, Some(&layer.attn_b), &mut qkv);
 
             // Append this chunk's keys/values, then read them back as slices.
             {
@@ -286,7 +400,7 @@ impl Gpt2 {
                 }
             }
 
-            matmul(&attn, t, d, &layer.attn_proj_w, d, Some(&layer.attn_proj_b), &mut proj);
+            layer.attn_proj_w.linear(&attn, t, d, Some(&layer.attn_proj_b), &mut proj);
             for i in 0..t * d {
                 x[i] += proj[i];
             }
@@ -295,11 +409,11 @@ impl Gpt2 {
             for i in 0..t {
                 layernorm(&x[i * d..(i + 1) * d], &layer.ln2_w, &layer.ln2_b, cfg.eps, &mut xa[i * d..(i + 1) * d]);
             }
-            matmul(&xa, t, d, &layer.fc_w, cfg.n_inner, Some(&layer.fc_b), &mut h);
+            layer.fc_w.linear(&xa, t, d, Some(&layer.fc_b), &mut h);
             for v in h.iter_mut() {
                 *v = gelu(*v);
             }
-            matmul(&h, t, cfg.n_inner, &layer.fc_proj_w, d, Some(&layer.fc_proj_b), &mut hout);
+            layer.fc_proj_w.linear(&h, t, cfg.n_inner, Some(&layer.fc_proj_b), &mut hout);
             for i in 0..t * d {
                 x[i] += hout[i];
             }
@@ -312,7 +426,7 @@ impl Gpt2 {
         let mut normed = vec![0.0f32; d];
         layernorm(last, &self.ln_f_w, &self.ln_f_b, cfg.eps, &mut normed);
         let mut logits = vec![0.0f32; cfg.n_vocab];
-        matmul(&normed, 1, d, &self.wte, cfg.n_vocab, None, &mut logits);
+        self.wte.linear(&normed, 1, d, None, &mut logits);
         logits
     }
 }
@@ -341,6 +455,18 @@ enum WeightLayout {
     InOut,
     /// `[out_dim, in_dim]`, the usual PyTorch linear layout.
     OutIn,
+}
+
+fn take_weight_proj(
+    tensors: &mut HashMap<String, Tensor>,
+    name: &str,
+    out_dim: usize,
+    in_dim: usize,
+    layout: WeightLayout,
+    precision: Precision,
+) -> Result<Weight, String> {
+    let data = take_weight(tensors, name, out_dim, in_dim, layout)?;
+    Weight::new(data, out_dim, in_dim, precision)
 }
 
 /// Load a projection weight as `[out_dim, in_dim]`, transposing when the

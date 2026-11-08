@@ -321,3 +321,39 @@ fn matches_class(c: char, class: u8) -> bool {
         _ => !c.is_whitespace() && !c.is_alphabetic() && !c.is_numeric(),
     }
 }
+
+/// Decodes token-by-token, holding back bytes of a partial UTF-8 sequence so
+/// multi-byte characters are never emitted split.
+pub struct StreamDecoder {
+    pending: Vec<u8>,
+}
+
+impl Default for StreamDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StreamDecoder {
+    pub fn new() -> Self {
+        StreamDecoder { pending: Vec::new() }
+    }
+
+    pub fn push(&mut self, tok: &Tokenizer, id: u32) -> String {
+        self.pending.extend_from_slice(&tok.token_bytes(id));
+        match std::str::from_utf8(&self.pending) {
+            Ok(s) => {
+                let out = s.to_string();
+                self.pending.clear();
+                out
+            }
+            Err(e) if e.valid_up_to() > 0 => {
+                let valid = e.valid_up_to();
+                let out = String::from_utf8_lossy(&self.pending[..valid]).into_owned();
+                self.pending.drain(..valid);
+                out
+            }
+            Err(_) => String::new(),
+        }
+    }
+}
