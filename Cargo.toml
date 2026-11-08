@@ -1,0 +1,15 @@
+[package]
+name = "gpt2"
+version = "0.1.0"
+edition = "2021"
+description = "GPT-2 implemented from scratch in pure Rust"
+
+[dependencies]
+serde_json = "1"
+rayon = "1"
+memmap2 = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
