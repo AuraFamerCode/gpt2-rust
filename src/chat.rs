@@ -365,7 +365,7 @@ pub fn run(
                 "help" => {
                     let _ = writeln!(
                         out,
-                        "  /help        this text\n  /reset       forget the conversation (clears the KV cache)\n  /save <file> write the transcript to <file>\n  /load <file> replace the conversation with <file>\n  /quit        exit"
+                        "  /help        this text\n  /reset       forget the conversation (clears the KV cache)\n  /save <file> write the transcript to <file>\n  /load [file] replace the conversation with <file>, default: newest *.txt here\n  /quit        exit"
                     );
                 }
                 "reset" => {
@@ -392,25 +392,33 @@ pub fn run(
                     }
                 }
                 "load" => {
-                    if arg.is_empty() {
-                        let _ = writeln!(out, "usage: /load <file>");
-                    } else {
-                        match session.load(model, tok, arg) {
-                            Ok((tokens, trimmed)) => {
-                                rows.clear();
-                                let note = if trimmed {
-                                    " (trimmed to fit the context window)"
-                                } else {
-                                    ""
-                                };
-                                let _ = writeln!(
-                                    out,
-                                    "(loaded {tokens} context tokens from {arg}{note})"
-                                );
-                            }
+                    // No argument: resume the transcript saved most recently here.
+                    let path = if arg.is_empty() {
+                        match newest_transcript() {
+                            Ok(path) => path,
                             Err(e) => {
                                 let _ = writeln!(out, "(not loaded: {e})");
+                                continue;
                             }
+                        }
+                    } else {
+                        arg.to_string()
+                    };
+                    match session.load(model, tok, &path) {
+                        Ok((tokens, trimmed)) => {
+                            rows.clear();
+                            let note = if trimmed {
+                                " (trimmed to fit the context window)"
+                            } else {
+                                ""
+                            };
+                            let _ = writeln!(
+                                out,
+                                "(loaded {tokens} context tokens from {path}{note})"
+                            );
+                        }
+                        Err(e) => {
+                            let _ = writeln!(out, "(not loaded: {e})");
                         }
                     }
                 }
@@ -533,6 +541,56 @@ fn write_chunk(out: &mut impl Write, chunk: &str, first: &mut bool) {
     }
 }
 
+/// The most recently modified `*.txt` file in the working directory that looks
+/// like a transcript written by `/save`, for a bare `/load`.
+fn newest_transcript() -> Result<String, String> {
+    let entries =
+        std::fs::read_dir(".").map_err(|e| format!("cannot list current directory: {e}"))?;
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_txt(&path) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(head) = read_head(&path) else { continue };
+        if !looks_like_transcript(&head) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().map_or(true, |(t, _)| modified > *t) {
+            best = Some((modified, name));
+        }
+    }
+    best.map(|(_, name)| name).ok_or_else(|| {
+        "no saved transcript here (expected a *.txt file starting with 'User: ')".to_string()
+    })
+}
+
+fn is_txt(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("txt"))
+        .unwrap_or(false)
+}
+
+/// A `/save` transcript opens with a user line; ordinary text files do not.
+fn looks_like_transcript(head: &str) -> bool {
+    head.trim_start().starts_with("User: ")
+}
+
+fn read_head(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut buf = [0u8; 512];
+    let mut file = std::fs::File::open(path)?;
+    let n = file.read(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
+}
+
 /// The conversation without the implied preamble, which is what `/save` writes.
 fn conversation_body(transcript: &str) -> &str {
     transcript.strip_prefix(PREAMBLE).unwrap_or(transcript)
@@ -633,6 +691,17 @@ mod tests {
             "{PREAMBLE}User: a\nAssistant: b\nUser: c\nAssistant: d\n"
         );
         assert_eq!(count_turns(&transcript), 2);
+    }
+
+    #[test]
+    fn recognises_saved_transcripts() {
+        assert!(looks_like_transcript("User: hi\nAssistant: hello\n"));
+        assert!(looks_like_transcript("\n  User: hi\n"));
+        assert!(!looks_like_transcript("plain prose\nUser: hi\n"));
+        assert!(!looks_like_transcript(""));
+        assert!(is_txt(std::path::Path::new("chat.txt")));
+        assert!(is_txt(std::path::Path::new("chat.TXT")));
+        assert!(!is_txt(std::path::Path::new("chat.md")));
     }
 
     #[test]

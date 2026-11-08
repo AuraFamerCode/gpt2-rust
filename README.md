@@ -113,7 +113,10 @@ How the session works:
   cache. The preamble is implied, so the file is just the `User:` / `Assistant:`
   exchange — readable, editable, and safe to keep in version control. A loaded
   file that no longer fits the window is trimmed from the front, the same way a
-  long session is.
+  long session is. Bare `/load` resumes the newest transcript in the current
+  directory: the most recently modified `*.txt` file that opens with a `User: `
+  line, which is what `/save` produces, so unrelated text files are skipped. It
+  reports the file it picked, so a resume is never a guess.
 
 ### Measuring what the cache saves
 
