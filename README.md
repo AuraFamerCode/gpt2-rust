@@ -36,6 +36,7 @@ options:
                            (default: models/gpt2)
   -n, --max-new-tokens <N> tokens to generate (default: 40, chat: 120)
       --chat               interactive REPL; keeps the conversation in the KV cache
+      --cache-report       chat: time a full re-prefill per turn and summarise the saving
   -t, --temp <F>           sampling temperature, 0 = greedy (default: 0.8)
       --top-k <N>          keep only the N most likely tokens (default: 40, 0 = off)
       --top-p <F>          nucleus sampling: keep the smallest set of tokens whose
@@ -74,7 +75,7 @@ Run with no prompt (or with `--chat`) on a terminal for an interactive REPL:
 $ ./target/release/gpt2
 
 gpt2 chat: 12 layers, 12 heads, d_model 768 (context 1024 tokens)
-commands: /help, /reset, /quit   (Ctrl-D to exit)
+commands: /help, /reset, /save, /load, /quit   (Ctrl-D to exit)
 
 you> What is the capital of France?
 gpt2> The capital of France is Paris.
@@ -107,6 +108,52 @@ How the session works:
 - `/reset` clears the conversation and cache, `/help` lists commands, `/quit` (or
   Ctrl-D) exits. `-n` sets the reply budget (120 by default in chat), and the
   sampling flags apply per turn.
+- `/save <file>` writes the conversation to disk as a plain transcript and
+  `/load <file>` replaces the current context with it, prefilled into a fresh
+  cache. The preamble is implied, so the file is just the `User:` / `Assistant:`
+  exchange — readable, editable, and safe to keep in version control. A loaded
+  file that no longer fits the window is trimmed from the front, the same way a
+  long session is.
+
+### Measuring what the cache saves
+
+Each turn is timed and reported on stderr, so the conversation text on stdout
+stays clean:
+
+```
+[turn 2] prefill 11 tok in 17.6 ms | decode 28 tok in 128 ms (4.7 ms/tok) | context 92 tok | cache saved 56 tok (~89.8 ms at this rate)
+```
+
+`--cache-report` also times a full re-prefill of the whole transcript every turn
+— exactly what a cacheless run would have to redo — and prints a summary on exit.
+`scripts/chat_cache_bench.sh` drives a scripted six-turn conversation and shows
+only those numbers:
+
+```
+$ scripts/chat_cache_bench.sh 6
+[turn 1] counterfactual: full prefill 60.6 ms vs cached 57.0 ms -> saved 3.6 ms (1.1x)
+[turn 2] counterfactual: full prefill 102.3 ms vs cached 17.6 ms -> saved 84.6 ms (5.8x)
+...
+KV cache report: 6 turns, context 56 -> 203 tok
+  turn   context   cached prefill   full prefill   saving
+     1        56          57.0 ms         60.6 ms     1.1x
+     2        92          17.6 ms        102.3 ms     5.8x
+     3       112          20.9 ms        131.9 ms     6.3x
+     4       144          20.5 ms        177.7 ms     8.7x
+     5       182          23.1 ms        236.9 ms    10.3x
+     6       203          25.1 ms        321.4 ms    12.8x
+  total                      164.1 ms       1030.8 ms     6.3x
+```
+
+Cached prefill stays roughly flat — it only ever pays for the new turn — while a
+full re-prefill grows linearly with the transcript. By turn 6 the cache avoided
+~296 ms of prefill, and the gap keeps widening as the conversation grows. (Turn 1
+includes the cold start: first touch of the mmap'd weights.)
+
+Decode slows slightly with context (4.1 → 5.8 ms/token above) because attention
+runs over more positions each step. That cost is unavoidable with or without the
+cache, and it is why the cache targets prefill: it removes the repeated prompt
+work, not the per-token attention.
 
 ## Performance
 

@@ -32,6 +32,7 @@ struct Args {
     logits: bool,
     precision: Precision,
     bench: Option<usize>,
+    cache_report: bool,
 }
 
 const USAGE: &str = "\
@@ -42,6 +43,7 @@ options:
                            (default: models/gpt2)
   -n, --max-new-tokens <N> tokens to generate (default: 40, chat: 120)
       --chat               interactive REPL; keeps the conversation in the KV cache
+      --cache-report       chat: time a full re-prefill per turn and summarise the saving
   -t, --temp <F>           sampling temperature, 0 = greedy (default: 0.8)
       --top-k <N>          keep only the N most likely tokens (default: 40, 0 = off)
       --top-p <F>          nucleus sampling: keep the smallest set of tokens whose
@@ -73,6 +75,7 @@ fn parse_args() -> Result<Args, String> {
         logits: false,
         precision: Precision::I8,
         bench: None,
+        cache_report: false,
     };
 
     let mut words: Vec<String> = Vec::new();
@@ -91,6 +94,7 @@ fn parse_args() -> Result<Args, String> {
                 args.max_new_set = true;
             }
             "--chat" | "-i" => args.chat = true,
+            "--cache-report" => args.cache_report = true,
             "-t" | "--temp" | "--temperature" => {
                 args.temp = next("--temp")?
                     .parse()
@@ -217,7 +221,15 @@ fn run() -> Result<(), String> {
         };
         let mut rng = Rng::new(args.seed);
         let mut out = std::io::stdout();
-        chat::run(&model, &mut tok, sampler, &mut rng, max_reply, &mut out)?;
+        chat::run(
+            &model,
+            &mut tok,
+            sampler,
+            &mut rng,
+            max_reply,
+            args.cache_report,
+            &mut out,
+        )?;
         return Ok(());
     }
 
